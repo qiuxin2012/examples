@@ -13,6 +13,8 @@ from zoo.common.nncontext import *
 from zoo.feature.common import FeatureSet
 from bigdl.optim.optimizer import Loss
 from zoo.pipeline.api.keras.metrics import Accuracy
+import time
+from zoo.pipeline.api.keras.objectives import SparseCategoricalCrossEntropy
 
 
 class Net(nn.Module):
@@ -34,7 +36,10 @@ class Net(nn.Module):
         return F.log_softmax(x, dim=1)
     
 def train(args, estimator, zooCriterion, train_loader, epoch):
+    t = time.time()
     for batch_idx, (data, target) in enumerate(train_loader):
+        # print(time.time() - t)
+        # t = time.time()
         estimator.train_minibatch(data.numpy(), target.numpy().astype(np.int32), zooCriterion)
         # data, target = data.to(device), target.to(device)
         # optimizer.zero_grad()
@@ -110,7 +115,18 @@ def main():
     model = Net().to(device)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
 
-    sc = init_nncontext(init_spark_conf().setMaster("local[8]").set("spark.driver.memory", "10g"))
+    num_executors = 4
+    num_cores_per_executor = 1
+    hadoop_conf_dir = os.environ.get('HADOOP_CONF_DIR')
+    sc = init_spark_on_yarn(
+        hadoop_conf=hadoop_conf_dir,
+        conda_name=os.environ["ZOO_CONDA_NAME"],  # The name of the created conda-env
+        num_executor=num_executors,
+        executor_cores=num_cores_per_executor,
+        executor_memory="10g",
+        driver_memory="10g",
+        driver_cores=1,
+        spark_conf={"spark.rpc.message.maxSize": "1024"})
     model.train()
     sgd = Adam()
     zooModel = TorchNet.from_pytorch(model, [64, 1, 28, 28])
@@ -118,6 +134,7 @@ def main():
         return nn.NLLLoss().forward(input, target.flatten().long())
 
     zooCriterion = TorchCriterion.from_pytorch(lossFunc, [1, 2], torch.LongTensor([1]))
+    # zooCriterion = SparseCategoricalCrossEntropy(zero_based_label=True)
     estimator = Estimator(zooModel, optim_methods=sgd)
 
     v_input = []

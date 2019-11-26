@@ -18,6 +18,15 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+from zoo.pipeline.api.net.torch_net import TorchNet
+from zoo.pipeline.api.net.torch_criterion import TorchCriterion
+from zoo.pipeline.estimator import *
+from bigdl.optim.optimizer import SGD, Adam
+from zoo.common.nncontext import *
+from zoo.feature.common import FeatureSet
+from bigdl.optim.optimizer import Loss
+from zoo.pipeline.api.keras.metrics import Accuracy
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -163,7 +172,7 @@ def main_worker(gpu, ngpus_per_node, args):
             model.features = torch.nn.DataParallel(model.features)
             model.cuda()
         else:
-            model = torch.nn.DataParallel(model).cuda()
+            model = torch.nn.DataParallel(model) #.cuda()
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
@@ -261,6 +270,30 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
+    num_executors = 2
+    num_cores_per_executor = 4
+    hadoop_conf_dir = os.environ.get('HADOOP_CONF_DIR')
+    sc = init_spark_on_yarn(
+        hadoop_conf=hadoop_conf_dir,
+        conda_name=os.environ["ZOO_CONDA_NAME"],  # The name of the created conda-env
+        num_executor=num_executors,
+        executor_cores=num_cores_per_executor,
+        executor_memory="20g",
+        driver_memory="10g",
+        driver_cores=1,
+        spark_conf={"spark.rpc.message.maxSize": "1024"})
+    model.train()
+    sgd = Adam()
+    zooModel = TorchNet.from_pytorch(model, [4, 3, 224, 224])
+    def lossFunc(input, target):
+        return nn.NLLLoss().forward(input, target.flatten().long())
+
+    zooCriterion = TorchCriterion.from_pytorch(lossFunc, [1, 2], torch.LongTensor([1]))
+    # zooCriterion = SparseCategoricalCrossEntropy(zero_based_label=True)
+    estimator = Estimator(zooModel, optim_methods=sgd)
+
+
+
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -279,24 +312,25 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
+        # if args.gpu is not None:
+        #     images = images.cuda(args.gpu, non_blocking=True)
+        # target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output = model(images)
-        loss = criterion(output, target)
-
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
-
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        estimator.train_minibatch(images.numpy(), target.numpy().astype(np.int32), zooCriterion)
+        # output = model(images)
+        # loss = criterion(output, target)
+        #
+        # # measure accuracy and record loss
+        # acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        # losses.update(loss.item(), images.size(0))
+        # top1.update(acc1[0], images.size(0))
+        # top5.update(acc5[0], images.size(0))
+        #
+        # # compute gradient and do SGD step
+        # optimizer.zero_grad()
+        # loss.backward()
+        # optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
